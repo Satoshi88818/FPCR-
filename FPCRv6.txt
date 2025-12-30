@@ -1,0 +1,303 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+import numpy as np
+import smplx  # pip install smplx
+from e3nn import o3
+from e3nn.nn.models.v2101.gate_points import Network as GatePointsNetwork
+from torch_geometric.data import Data, Batch
+
+# Helper rotation functions (unchanged)
+def skew(v: Tensor) -> Tensor:
+    zero = torch.zeros_like(v[..., 0])
+    return torch.stack([
+        zero, -v[..., 2], v[..., 1],
+        v[..., 2], zero, -v[..., 0],
+        -v[..., 1], v[..., 0], zero
+    ], dim=-1).reshape(*v.shape[:-1], 3, 3)
+
+def axis_angle_to_rotmat(aa: Tensor) -> Tensor:
+    angle = torch.norm(aa, dim=-1, keepdim=True)
+    axis = aa / (angle + 1e-8)
+    cos = torch.cos(angle)
+    sin = torch.sin(angle)
+    outer = torch.matmul(axis.unsqueeze(-1), axis.unsqueeze(-2))
+    eye = torch.eye(3, device=aa.device).expand(*aa.shape[:-1], 3, 3)
+    return cos.unsqueeze(-1).unsqueeze(-1) * eye + \
+           sin.unsqueeze(-1).unsqueeze(-1) * skew(axis) + \
+           (1 - cos.unsqueeze(-1).unsqueeze(-1)) * outer
+
+def rotmat_to_axis_angle(R: Tensor) -> Tensor:
+    trace = torch.einsum('...ii', R)
+    angle = torch.acos(torch.clamp((trace - 1) / 2, -1 + 1e-6, 1 - 1e-6))
+    sin_angle = torch.sin(angle)
+    axis = torch.stack([
+        R[..., 2, 1] - R[..., 1, 2],
+        R[..., 0, 2] - R[..., 2, 0],
+        R[..., 1, 0] - R[..., 0, 1]
+    ], dim=-1) / (2 * sin_angle.unsqueeze(-1) + 1e-8)
+    small_angle_mask = sin_angle < 1e-6
+    if small_angle_mask.any():
+        axis[small_angle_mask] = torch.tensor([1.0, 0.0, 0.0], device=R.device)
+    aa = axis * angle.unsqueeze(-1)
+    return aa
+
+def random_rotmat(batch_size: int, device: torch.device) -> Tensor:
+    u = torch.randn(batch_size, 3, 3, device=device)
+    q, r = torch.linalg.qr(u)
+    d = torch.diagonal(r, dim1=-2, dim2=-1).sign()
+    q = q * d.unsqueeze(-2).unsqueeze(-1)
+    det = torch.det(q)
+    q[:, :, 0] *= det.sign().unsqueeze(-1)
+    return q
+
+# Equivariant Feature Extraction (updated for richer irreps)
+class EquivariantFeatureExtraction(nn.Module):
+    def __init__(self, feature_dim=64):
+        super().__init__()
+        irreps_sh = o3.Irreps.spherical_harmonics(lmax=3)
+        self.model = GatePointsNetwork(
+            irreps_in=None,
+            irreps_hidden=o3.Irreps("32x0e + 32x1o + 16x2e"),
+            irreps_out=o3.Irreps(f"{feature_dim}x0e"),
+            irreps_edge_attr=irreps_sh,
+            irreps_node_attr="0e",
+            layers=4,
+            max_radius=5.0,
+            number_of_basis=10,
+            radial_layers=2,
+            radial_neurons=64,
+            num_neighbors=20.0,
+            num_nodes=1024.0
+        )
+
+    def forward(self, P: Tensor):
+        B, N, _ = P.shape
+        data_list = [Data(pos=P[b]) for b in range(B)]
+        batch = Batch.from_data_list(data_list)
+        F = self.model(batch)
+        F = F.view(B, N, -1)
+        return F
+
+# Simple Denoising Score Network (equivariant via e3nn convolution)
+class DenoisingScoreNet(nn.Module):
+    def __init__(self, feature_dim=64):
+        super().__init__()
+        self.feat_extract = EquivariantFeatureExtraction(feature_dim=feature_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(feature_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 3)  # Predict noise (or velocity)
+        )
+
+    def forward(self, P_noisy: Tensor, P_cond: Tensor, t_emb: Tensor):
+        # Concatenate noisy points and conditioned front points
+        P_combined = torch.cat([P_noisy, P_cond], dim=1)  # B, 2N, 3
+        F = self.feat_extract(P_combined)  # B, 2N, C
+        # Split features and use noisy part
+        F_noisy = F[:, :P_noisy.shape[1]]
+        # Add time embedding
+        F_noisy = F_noisy + t_emb.unsqueeze(1)
+        score = self.mlp(F_noisy)
+        return score
+
+# Diffusion-based Back Completion Module with Symmetry Priors
+class DiffusionBackCompletionModule(nn.Module):
+    def __init__(self, num_parts=24, feature_dim=64, num_steps=50):
+        super().__init__()
+        self.num_parts = num_parts
+        self.num_steps = num_steps
+        self.score_net = DenoisingScoreNet(feature_dim)
+        self.feat_extract = EquivariantFeatureExtraction(feature_dim=feature_dim + 32)
+        self.mlp_label = nn.Sequential(
+            nn.Linear(feature_dim + 32, 128), nn.ReLU(),
+            nn.Linear(128, 256), nn.ReLU(),
+            nn.Linear(256, num_parts)
+        )
+
+    def add_noise(self, P: Tensor, t: Tensor):
+        noise = torch.randn_like(P)
+        alpha_t = 1 - t.unsqueeze(-1).unsqueeze(-1)  # Simple linear schedule
+        return alpha_t * P + (1 - alpha_t) * noise, noise
+
+    @torch.no_grad()
+    def sample(self, P_F: Tensor, steps=None):
+        steps = steps or self.num_steps
+        B, N, _ = P_F.shape
+        device = P_F.device
+        # Initial noisy back: start from mirrored front with noise
+        P_B = P_F.clone()
+        P_B[..., 0] *= -1  # Mirror across YZ plane (bilateral symmetry)
+        P_B = P_B + torch.randn_like(P_B) * 0.5
+
+        t_emb = torch.linspace(1.0, 0.0, steps + 1, device=device)  # t from 1 to 0
+        for i in range(steps):
+            t = torch.full((B,), t_emb[i], device=device)
+            t_next = torch.full((B,), t_emb[i+1], device=device)
+            t_emb_i = t.unsqueeze(-1)  # B,1
+
+            score = self.score_net(P_B, P_F, t_emb_i)
+            # Simple Euler integration (velocity ~ score)
+            P_B = P_B + (t_next - t).unsqueeze(-1).unsqueeze(-1) * (-score)
+
+            # Symmetry prior: enforce bilateral symmetry softly
+            P_B_mirrored = P_B.clone()
+            P_B_mirrored[..., 0] *= -1
+            P_B = 0.5 * (P_B + P_B_mirrored) + 0.1 * torch.randn_like(P_B)
+
+        return P_B
+
+    def forward(self, P_F: Tensor, P_B_gt=None):
+        # During training: conditional denoising loss on known back
+        if self.training and P_B_gt is not None:
+            B, N, _ = P_F.shape
+            t = torch.rand(B, device=P_F.device)
+            P_B_noisy, noise = self.add_noise(P_B_gt, t)
+            t_emb = t.unsqueeze(-1).unsqueeze(-1)
+            pred_noise = self.score_net(P_B_noisy, P_F, t_emb)
+            loss_diff = F.mse_loss(pred_noise, noise)
+        else:
+            loss_diff = torch.tensor(0.0, device=P_F.device)
+
+        # Inference-time completion
+        P_B = self.sample(P_F)
+
+        # Part segmentation on front and completed back
+        Q_F = self.feat_extract(P_F)
+        I_F_logit = self.mlp_label(Q_F)
+        I_F = F.softmax(I_F_logit, dim=-1)
+
+        Q_B = self.feat_extract(P_B)
+        I_B_logit = self.mlp_label(Q_B)
+        I_B = F.softmax(I_B_logit, dim=-1)
+
+        return P_B, I_F, I_B, I_F_logit, I_B_logit, loss_diff
+
+# Rest of the modules (updated pose with 6D, stronger shape)
+class SelfAttention(nn.Module):
+    def __init__(self, in_dim, out_dim, num_heads=8, num_layers=2):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(in_dim, num_heads, batch_first=True)
+        self.proj = nn.Linear(in_dim, out_dim) if out_dim != in_dim else nn.Identity()
+        self.norm = nn.LayerNorm(in_dim)
+        self.layers = num_layers
+
+    def forward(self, x: Tensor):
+        for _ in range(self.layers):
+            attn_out, _ = self.attn(x, x, x)
+            x = self.norm(x + attn_out)
+        x = self.proj(x)
+        return x
+
+class PosePredictionModule(nn.Module):
+    def __init__(self, num_parts=24, feature_dim=64):
+        super().__init__()
+        self.attn = SelfAttention(feature_dim, 128)
+        self.mlp_rot = nn.Linear(128, 6)  # 6D rotation
+
+    def forward(self, F: Tensor, I: Tensor):
+        Omega_Equ = torch.einsum('bnk,bnc->bkc', I, F)
+        Omega_att = self.attn(Omega_Equ)
+        rot6d = self.mlp_rot(Omega_att)
+        theta_per_part = self.rot6d_to_aa(rot6d.view(-1, 6)).view(Omega_Equ.shape[0], -1)
+        return theta_per_part
+
+    def rot6d_to_aa(self, rot6d: Tensor):
+        a1, a2 = rot6d[..., :3], rot6d[..., 3:]
+        b1 = F.normalize(a1, dim=-1)
+        b2 = F.normalize(a2 - (b1 * a2).sum(-1, keepdim=True) * b1, dim=-1)
+        b3 = torch.cross(b1, b2)
+        R = torch.stack([b1, b2, b3], dim=-2)
+        return rotmat_to_axis_angle(R)
+
+class ShapePredictionModule(nn.Module):
+    def __init__(self, num_parts=24, feature_dim=64):
+        super().__init__()
+        self.attn = SelfAttention(feature_dim, 64)
+        self.global_pool = nn.AdaptiveAvgPool1d(64)
+        self.mlp = nn.Sequential(nn.Linear(64, 128), nn.ReLU(), nn.Linear(128, 10))
+
+    def forward(self, Omega_Equ: Tensor):
+        Omega_att = self.attn(Omega_Equ)
+        global_feat = self.global_pool(Omega_att.permute(0, 2, 1)).squeeze(-1)
+        beta = self.mlp(global_feat)
+        return beta
+
+class SMPL(nn.Module):
+    def __init__(self, model_path, gender='neutral'):
+        super().__init__()
+        self.smpl = smplx.create(model_path, model_type='smpl', gender=gender)
+
+    def forward(self, theta: Tensor, beta: Tensor):
+        output = self.smpl(betas=beta, body_pose=theta[:, 3:], global_orient=theta[:, :3])
+        return output.vertices, output.joints
+
+class FPCRNet(nn.Module):
+    def __init__(self, num_parts=24, feature_dim=64):
+        super().__init__()
+        self.back_comp = DiffusionBackCompletionModule(num_parts, feature_dim)
+        self.feat_extract_f = EquivariantFeatureExtraction(feature_dim)
+        self.feat_extract_b = EquivariantFeatureExtraction(feature_dim)
+        self.pose_pred = PosePredictionModule(num_parts, feature_dim)
+        self.shape_pred = ShapePredictionModule(num_parts, feature_dim)
+        self.smpl = SMPL(model_path="path/to/smpl/models/SMPL_NEUTRAL.pkl")
+
+    def forward(self, P_F: Tensor, P_B_gt=None):
+        P_B, I_F, I_B, I_F_logit, I_B_logit, loss_diff = self.back_comp(P_F, P_B_gt)
+        F_F = self.feat_extract_f(P_F)
+        F_B = self.feat_extract_b(P_B)
+        F = torch.cat([F_F, F_B], dim=1)
+        I = torch.cat([I_F, I_B], dim=1)
+        theta = self.pose_pred(F, I)
+        Omega_Equ = torch.einsum('bnk,bnc->bkc', I, F)
+        beta = self.shape_pred(Omega_Equ)
+        return theta, beta, P_B, I_F_logit, I_B_logit, loss_diff
+
+# Toy training loop
+if __name__ == "__main__":
+    N = 1024
+    B = 2
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = FPCRNet().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    smpl_model = model.smpl.smpl
+    for epoch in range(10):
+        theta_gt = torch.rand(B, 72, device=device) * 0.1
+        beta_gt = torch.rand(B, 10, device=device) * 0.1
+        output = smpl_model(betas=beta_gt, body_pose=theta_gt[:, 3:], global_orient=theta_gt[:, :3])
+        verts_gt = output.vertices.to(device)
+        joints_gt = output.joints.to(device)
+
+        aug_R = random_rotmat(B, device)
+        verts_gt = torch.einsum('bvj,bjk->bvk', verts_gt, aug_R)
+        joints_gt = torch.einsum('bvj,bjk->bvk', joints_gt, aug_R)
+        orig_R = axis_angle_to_rotmat(theta_gt[:, :3])
+        new_R = torch.matmul(aug_R, orig_R)
+        theta_gt[:, :3] = rotmat_to_axis_angle(new_R)
+
+        P_F = torch.zeros(B, N, 3, device=device)
+        P_B_gt = torch.zeros(B, N, 3, device=device)
+        gt_I_F = torch.zeros(B, N, dtype=torch.long, device=device)
+        gt_I_B = torch.zeros(B, N, dtype=torch.long, device=device)
+        lbs_weights = smpl_model.lbs_weights
+        part_labels = lbs_weights.argmax(dim=-1)
+        for b in range(B):
+            z = verts_gt[b, :, 2]
+            front_idx = z.argsort(descending=True)[:N]
+            back_idx = z.argsort(ascending=True)[:N]
+            P_F[b] = verts_gt[b, front_idx]
+            gt_I_F[b] = part_labels[front_idx]
+            P_B_gt[b] = verts_gt[b, back_idx]
+            gt_I_B[b] = part_labels[back_idx]
+
+        theta, beta, P_B, I_F_logit, I_B_logit, loss_diff = model(P_F, P_B_gt)
+        # Simple combined loss (add real metrics/losses as needed)
+        loss = loss_diff + F.mse_loss(theta, theta_gt) + F.mse_loss(beta, beta_gt)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        print(f"Epoch {epoch}, Loss: {loss.item():.4f} (incl. diffusion {loss_diff.item():.4f})")
+
+    print("Advanced FPCRNet with diffusion-based back completion and bilateral symmetry priors (mirroring + soft enforcement).")
